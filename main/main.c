@@ -241,9 +241,10 @@ static void filter_inquiry_scan_result(esp_bt_gap_cb_param_t *param)
     if (eir) {
         get_name_from_eir(eir, s_peer_bdname, NULL);
         ESP_LOGI(BT_AV_TAG, "--BDNAME: %s", s_peer_bdname);
-        if (strcmp((char *)s_peer_bdname, "JBL GO 2") != 0) {
+        /*if (strcmp((char *)s_peer_bdname, "JBL GO 2") != 0
+                && strcmp((char *)s_peer_bdname, "AWEI AK-MUSIC") != 0) {
             return;
-        }
+        }*/
 
         ESP_LOGI(BT_AV_TAG, "Found a target device, address %s, name %s", bda_str, s_peer_bdname);
         s_a2d_state = APP_AV_STATE_DISCOVERED;
@@ -395,8 +396,13 @@ static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len)
     // generate random sequence
     int val = rand() % (1 << 16);
     for (int i = 0; i < (len >> 1); i++) {
-        data[(i << 1)] = val & 0xff;
-        data[(i << 1) + 1] = (val >> 8) & 0xff;
+        if(i % 2) { // right channel
+            data[(i << 1)] = 0x0f;
+            data[(i << 1) + 1] = 0xff;
+        } else { //left channel
+            data[(i << 1)] = val & 0xff;
+            data[(i << 1) + 1] = (val >> 8) & 0xff;
+        }
     }
 
     return len;
