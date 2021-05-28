@@ -44,4 +44,6 @@ void bt_app_task_start_up(void);
 
 void bt_app_task_shut_down(void);
 
+void i2s_task_handler(void *arg);
+
 #endif /* __BT_APP_CORE_H__ */

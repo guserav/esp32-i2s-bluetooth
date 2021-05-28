@@ -18,6 +18,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 
+#include "driver/i2s.h"
 #include "esp_bt.h"
 #include "bt_app_core.h"
 #include "esp_bt_main.h"
@@ -95,6 +96,29 @@ static uint32_t s_pkt_cnt = 0;
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
 static TimerHandle_t s_tmr;
 
+// I2S configuration
+static const int i2s_num = 0; // i2s port number
+#define I2S_DMA_BUF_LEN 512
+#define I2S_DMA_BUF_COUNT 4
+static const i2s_config_t i2s_config = {
+    .mode = I2S_MODE_SLAVE | I2S_MODE_RX,
+    .sample_rate = 44100,
+    .bits_per_sample = 16,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0, // default interrupt priority
+    .dma_buf_count = I2S_DMA_BUF_COUNT,
+    .dma_buf_len = I2S_DMA_BUF_LEN,
+    .use_apll = false
+};
+
+static const i2s_pin_config_t i2s_pin_config = {
+    .bck_io_num = 26,
+    .ws_io_num = 25,
+    .data_in_num = 22,
+    .data_out_num = I2S_PIN_NO_CHANGE
+};
+
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
 {
     if (bda == NULL || str == NULL || size < 18) {
@@ -138,6 +162,16 @@ void app_main(void)
 
     if (esp_bluedroid_enable() != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s enable bluedroid failed\n", __func__);
+        return;
+    }
+
+    if (i2s_driver_install(i2s_num, &i2s_config, 0, NULL) != ESP_OK) {
+        ESP_LOGE(BT_AV_TAG, "%s initialize i2s failed\n", __func__);
+        return;
+    }
+
+    if (i2s_set_pin(i2s_num, &i2s_pin_config) != ESP_OK) {
+        ESP_LOGE(BT_AV_TAG, "%s pin config failed\n", __func__);
         return;
     }
 
@@ -386,26 +420,87 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     bt_app_work_dispatch(bt_app_av_sm_hdlr, event, param, sizeof(esp_a2d_cb_param_t), NULL);
 }
+#define I2S_CICLYC_BUFFER_COUNT 20
+#define I2S_WARN_INTERVAL 100
+struct i2s_buffer {
+    uint8_t data[I2S_DMA_BUF_LEN];
+    size_t fill_level;
+} i2s_buffers[I2S_CICLYC_BUFFER_COUNT];
+uint8_t i2s_buffer_start = 0; // Index of buffer to use next for sending
+uint8_t i2s_buffer_end = 0; // Index of next buffer to use for receiving
+size_t current_buffer_pos = 0;
+size_t warn_underflow = 0;
+
+void i2s_task_handler(void *arg)
+{
+    size_t warn_overflow = 0;
+    for (size_t i = 0; i < I2S_CICLYC_BUFFER_COUNT; i++) {
+        i2s_buffers[i].fill_level = 0;
+    }
+    const TickType_t xDelay = 100 / portTICK_PERIOD_MS;
+    for (;;) {
+        if(APP_AV_STATE_CONNECTED != s_a2d_state) { // No need to read i2s while not connected to bluetooth
+            vTaskDelay(xDelay);
+            continue;
+        }
+        if(i2s_buffer_start == (i2s_buffer_end + 1) % I2S_CICLYC_BUFFER_COUNT) {
+            i2s_buffer_start = (i2s_buffer_start + 1) % I2S_CICLYC_BUFFER_COUNT; // Clear next buffer as it will be overwritten
+            if(0 == warn_overflow) {
+                warn_overflow = I2S_WARN_INTERVAL;
+                ESP_LOGE(BT_AV_TAG, "%s i2s cyclic buffers ran full", __func__);
+            } else {
+                warn_overflow--;
+            }
+            vTaskDelay(1);
+        }
+        esp_err_t ret = i2s_read(i2s_num, i2s_buffers[i2s_buffer_end].data, I2S_DMA_BUF_LEN, &i2s_buffers[i2s_buffer_end].fill_level, portMAX_DELAY);
+        if (ESP_OK == ret) {
+            i2s_buffer_end = (i2s_buffer_end + 1) % I2S_CICLYC_BUFFER_COUNT;
+        } else {
+            ESP_LOGE(BT_AV_TAG, "%s i2s_read failed.", __func__);
+        }
+    }
+}
+
 
 static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len)
 {
     if (len < 0 || data == NULL) {
         return 0;
     }
-
-    // generate random sequence
-    int val = rand() % (1 << 16);
-    for (int i = 0; i < (len >> 1); i++) {
-        if(i % 2) { // right channel
+    if(i2s_buffer_start == i2s_buffer_end) {
+        if(0 == warn_underflow) {
+            warn_underflow = I2S_WARN_INTERVAL;
+            ESP_LOGE(BT_AV_TAG, "%s i2s cyclic were empty", __func__);
+        } else {
+            warn_underflow--;
+        }
+        // generate silence
+        //int val = rand() % (1 << 16);
+        for (int i = 0; i < (len >> 1); i++) {
             data[(i << 1)] = 0x0f;
             data[(i << 1) + 1] = 0xff;
-        } else { //left channel
-            data[(i << 1)] = val & 0xff;
-            data[(i << 1) + 1] = (val >> 8) & 0xff;
+        }
+
+        return len;
+    }
+    int32_t i;
+    for(i = 0; i < len; i++) {
+        if(current_buffer_pos < i2s_buffers[i2s_buffer_start].fill_level) {
+            data[i] = i2s_buffers[i2s_buffer_start].data[current_buffer_pos++];
+        } else {
+            ESP_LOGE(BT_AV_TAG, "%s i2s buffer read %d from buffer %d", __func__, i, i2s_buffer_start);
+            current_buffer_pos = 0;
+            i2s_buffer_start = (i2s_buffer_start + 1) % I2S_CICLYC_BUFFER_COUNT;
+            return i;
         }
     }
-
-    return len;
+    ESP_LOGE(BT_AV_TAG, "%s i2s buffer read %d from buffer %d", __func__, i, i2s_buffer_start);
+    if(current_buffer_pos >= i2s_buffers[i2s_buffer_start].fill_level) {
+        current_buffer_pos = 0;
+        i2s_buffer_start = (i2s_buffer_start + 1) % I2S_CICLYC_BUFFER_COUNT;
+    }
+    return i;
 }
 
 static void a2d_app_heart_beat(void *arg)
